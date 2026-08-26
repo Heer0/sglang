@@ -1,0 +1,27 @@
+# Soma spike image — SGLang Diffusion main overlay sur la base stable prébuildée,
+# pour héberger LTX-2.5 comfy-W4A8 ConvRot sur RTX 4080 16 Go (HAMi, layerwise offload).
+#
+# Approche prouvée (KG namedis.soma/sglang-ltx-w4a8-spike) :
+#   - base = lmsysorg/sglang:latest : kernels compilés 0.5.18 réutilisables tels quels.
+#   - comfy-kitchen 0.2.31 (wheel prébuildé) via pip --break-system-packages (PEP 668).
+#   - COPY de TOUT le package python/sglang de main par-dessus (main's multimodal_gen
+#     dépend de main's srt) — écrase le package, garde les .so compilés.
+#   - contient notre fix de détection comfy-W4A8 (branche soma/comfy-w4a8).
+#
+# Build (attention piège Zot readTimeout/writeTimeout sur la couche base-cuda, KG
+# zot-60s-timeout-large-blob — fixé côté zot.yaml sur oci.gitny.k3s) :
+#   docker build -f docker/Dockerfile.soma -t oci.gitny.k3s/soma/sglang-spike:<tag> .
+#   docker push oci.gitny.k3s/soma/sglang-spike:<tag>
+#
+# Itération rapide SANS rebuild : voir sync-to-pod.sh (rsync python/sglang -> pod).
+
+FROM lmsysorg/sglang:latest
+
+# comfy-kitchen : dépendances runtime des KitchenW4A8Config/KitchenInt8Config.
+RUN pip install --break-system-packages --no-cache-dir comfy-kitchen==0.2.31
+
+# Overlay du package sglang de main (avec le fix soma/comfy-w4a8) sur la base stable.
+# Les extensions compilées (.so) de l'image de base restent en place (imports OK).
+COPY python/sglang /sgl-workspace/sglang/python/sglang
+
+ENV HF_HUB_OFFLINE=1
