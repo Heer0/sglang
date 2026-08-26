@@ -35,7 +35,10 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
 )
-from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    get_param_names_mapping,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
@@ -57,6 +60,8 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
+    inspect_comfy_quant_markers,
+    resolve_comfy_checkpoint_quantization,
 )
 from sglang.srt.utils.hf_transformers import (
     check_gguf_file,
@@ -761,6 +766,38 @@ def _filter_duplicate_precision_variant_safetensors(
     return filtered
 
 
+def _make_comfy_param_name_mapper(
+    model_cls: type[nn.Module],
+) -> Callable[[str], str] | None:
+    """Map serialized Comfy layer prefixes into the native model namespace.
+
+    Comfy-Kitchen encodes per-layer quant markers keyed by the *checkpoint*
+    module names (e.g. ``model.diffusion_model.transformer_blocks.0.attn1.to_k``
+    or ``proj_in`` / ``ff.net.0.proj``). The DiT builds its linears under the
+    native SGLang names (``transformer_blocks.0.attn1.to_k``, ``patchify_proj``,
+    ``ff.proj_in`` …), so the markers must be remapped or ``get_quant_method``
+    would miss every linear and fall back to full-width unquantized layers.
+    Mirrors the text-encoder loader's ``name_mapper`` idiom.
+    """
+    mapping = vars(model_cls).get("param_names_mapping", {})
+    if not mapping:
+        return None
+    mapping_fn = get_param_names_mapping(mapping)
+
+    def name_mapper(name: str) -> str:
+        # Layer-prefix metadata omits the suffix that many model mappings use
+        # to delimit a parameter name, so map ``<prefix>.weight`` and strip it.
+        mapped_name, merge_index, _ = mapping_fn(f"{name}.weight")
+        if merge_index is not None:
+            raise ValueError(
+                "Serialized Comfy transformer weights cannot use a stacked "
+                "parameter-name mapping"
+            )
+        return mapped_name.removesuffix(".weight")
+
+    return name_mapper
+
+
 def resolve_transformer_quant_load_spec(
     *,
     hf_config: dict,
@@ -804,6 +841,22 @@ def resolve_transformer_quant_load_spec(
             safetensors_list=safetensors_list,
             component_model_path=component_model_path,
         )
+        # Comfy-Kitchen per-layer quant (e.g. asym_w4a8_int8 ConvRot LTX-2.5) lives
+        # in `__metadata__._quantization_metadata.layers`, not a top-level
+        # quant_method, so the generic resolver above misses it. Detect it here
+        # where `model_cls` is available: the markers must be mapped into the
+        # native namespace so each ColumnParallelLinear/RowParallelLinear is built
+        # packed (int4) instead of full-width. Mirrors the text-encoder loader.
+        if (
+            quant_config is None
+            and server_args.transformer_weights_path
+            and safetensors_list
+        ):
+            comfy_markers = inspect_comfy_quant_markers(
+                safetensors_list,
+                param_name_mapper=_make_comfy_param_name_mapper(model_cls),
+            )
+            quant_config = resolve_comfy_checkpoint_quantization(comfy_markers)
 
     if quant_config is not None:
         packed = getattr(model_cls, "packed_modules_mapping", None)

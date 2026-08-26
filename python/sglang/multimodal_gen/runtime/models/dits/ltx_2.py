@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -606,13 +607,20 @@ class LTX2TextProjection(nn.Module):
         hidden_size: int,
         out_features: int | None = None,
         act_fn: str = "gelu_tanh",
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if out_features is None:
             out_features = hidden_size
 
         self.linear_1 = ColumnParallelLinear(
-            in_features, hidden_size, bias=True, gather_output=True
+            in_features,
+            hidden_size,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_1",
         )
         if act_fn == "gelu_tanh":
             self.act_1 = nn.GELU(approximate="tanh")
@@ -622,7 +630,12 @@ class LTX2TextProjection(nn.Module):
             raise ValueError(f"Unknown activation function: {act_fn}")
 
         self.linear_2 = ColumnParallelLinear(
-            hidden_size, out_features, bias=True, gather_output=True
+            hidden_size,
+            out_features,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_2",
         )
 
     def forward(self, caption: torch.Tensor) -> torch.Tensor:
@@ -633,13 +646,29 @@ class LTX2TextProjection(nn.Module):
 
 
 class LTX2TimestepEmbedder(nn.Module):
-    def __init__(self, embedding_dim: int, in_channels: int = 256) -> None:
+    def __init__(
+        self,
+        embedding_dim: int,
+        in_channels: int = 256,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.linear_1 = ColumnParallelLinear(
-            in_channels, embedding_dim, bias=True, gather_output=True
+            in_channels,
+            embedding_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_1",
         )
         self.linear_2 = ColumnParallelLinear(
-            embedding_dim, embedding_dim, bias=True, gather_output=True
+            embedding_dim,
+            embedding_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_2",
         )
 
     def forward(self, t_emb: torch.Tensor) -> torch.Tensor:
@@ -650,9 +679,19 @@ class LTX2TimestepEmbedder(nn.Module):
 
 
 class LTX2PixArtAlphaCombinedTimestepSizeEmbeddings(nn.Module):
-    def __init__(self, embedding_dim: int) -> None:
+    def __init__(
+        self,
+        embedding_dim: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
-        self.timestep_embedder = LTX2TimestepEmbedder(embedding_dim, in_channels=256)
+        self.timestep_embedder = LTX2TimestepEmbedder(
+            embedding_dim,
+            in_channels=256,
+            quant_config=quant_config,
+            prefix=f"{prefix}.timestep_embedder",
+        )
 
     def forward(
         self, timestep: torch.Tensor, hidden_dtype: torch.dtype | None = None
@@ -665,15 +704,27 @@ class LTX2PixArtAlphaCombinedTimestepSizeEmbeddings(nn.Module):
 
 
 class LTX2AdaLayerNormSingle(nn.Module):
-    def __init__(self, embedding_dim: int, embedding_coefficient: int = 6) -> None:
+    def __init__(
+        self,
+        embedding_dim: int,
+        embedding_coefficient: int = 6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
-        self.emb = LTX2PixArtAlphaCombinedTimestepSizeEmbeddings(embedding_dim)
+        self.emb = LTX2PixArtAlphaCombinedTimestepSizeEmbeddings(
+            embedding_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.emb",
+        )
         self.silu = nn.SiLU()
         self.linear = ColumnParallelLinear(
             embedding_dim,
             embedding_coefficient * embedding_dim,
             bias=True,
             gather_output=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear",
         )
 
     def forward(
@@ -775,6 +826,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_q",
         )
         self.to_k = ColumnParallelLinear(
             self.context_dim,
@@ -782,6 +834,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_k",
         )
         self.to_v = ColumnParallelLinear(
             self.context_dim,
@@ -789,6 +842,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_v",
         )
         self.to_gate_logits: ColumnParallelLinear | None = None
         if self.apply_gated_attention:
@@ -798,6 +852,7 @@ class LTX2Attention(nn.Module):
                 bias=True,
                 gather_output=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_gate_logits",
             )
 
         self.q_norm: nn.Module | None = None
@@ -825,6 +880,7 @@ class LTX2Attention(nn.Module):
                 bias=True,
                 input_is_parallel=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_out.0",
             ),
             nn.Identity(),
         )
@@ -1045,6 +1101,31 @@ class LTX2Attention(nn.Module):
         raise ValueError(f"Unexpected RoPE tensor rank: {cos.ndim}. Expected 3 or 4.")
 
 
+def _ffn_chunk_size() -> int:
+    """Taille de chunk (en tokens) pour le FFN chunking du DiT LTX.
+
+    Découper la séquence dans le FFN casse le plancher VRAM du denoising :
+    les activations intermédiaires `seq_len * inner_dim` (inner ~= 15360 pour
+    LTX-2.5) sont matérialisées par chunk au lieu de la séquence entière.
+    Numériquement neutre (le FFN est pointwise sur les tokens) et quant-safe
+    (chaque chunk repasse par les mêmes Column/RowParallelLinear W4A8/int8,
+    qui opèrent par token).
+
+    Lu depuis `SOMA_FFN_CHUNK` (ou `SGLANG_FFN_CHUNK_SIZE`). 0 ou absent =>
+    pas de chunking (comportement d'origine, défaut sûr).
+    """
+    raw = os.environ.get("SOMA_FFN_CHUNK") or os.environ.get(
+        "SGLANG_FFN_CHUNK_SIZE"
+    )
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
+
+
 class LTX2FeedForward(nn.Module):
     def __init__(
         self,
@@ -1053,6 +1134,7 @@ class LTX2FeedForward(nn.Module):
         mult: int = 4,
         bias: bool = True,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if dim_out is None:
@@ -1060,7 +1142,12 @@ class LTX2FeedForward(nn.Module):
         inner_dim = int(dim * mult)
 
         self.proj_in = ColumnParallelLinear(
-            dim, inner_dim, bias=bias, gather_output=False, quant_config=quant_config
+            dim,
+            inner_dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_in",
         )
         self.act = nn.GELU(approximate="tanh")
         self.proj_out = RowParallelLinear(
@@ -1069,10 +1156,11 @@ class LTX2FeedForward(nn.Module):
             bias=bias,
             input_is_parallel=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.proj_out",
         )
         mark_fused_gelu_site(self, "proj_in")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_dense(self, x: torch.Tensor) -> torch.Tensor:
         if fused_gelu_active(self) and can_use_linear_gelu(self.proj_in, x):
             x = fused_linear_gelu_tanh(x, self.proj_in.weight, self.proj_in.bias)
         else:
@@ -1080,6 +1168,16 @@ class LTX2FeedForward(nn.Module):
             x = self.act(x)
         x, _ = self.proj_out(x)
         return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x : [batch, seq, hidden] (le FFN est pointwise sur l'axe seq = -2).
+        chunk = _ffn_chunk_size()
+        if chunk <= 0 or x.shape[-2] <= chunk:
+            return self._forward_dense(x)
+        outs = [
+            self._forward_dense(seg) for seg in torch.split(x, chunk, dim=-2)
+        ]
+        return torch.cat(outs, dim=-2)
 
 
 class LTX2TransformerBlock(nn.Module):
@@ -1208,11 +1306,19 @@ class LTX2TransformerBlock(nn.Module):
         # 4. Feedforward layers
         # LTX-2.5: `ff_bias: false`, `audio_ff_bias: true`.
         self.ff = LTX2FeedForward(
-            dim, dim_out=dim, bias=ff_bias, quant_config=quant_config
+            dim,
+            dim_out=dim,
+            bias=ff_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff",
         )
         mark_ltx2_rms_norm_modulate_site(self)
         self.audio_ff = LTX2FeedForward(
-            audio_dim, dim_out=audio_dim, bias=audio_ff_bias, quant_config=quant_config
+            audio_dim,
+            dim_out=audio_dim,
+            bias=audio_ff_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_ff",
         )
 
         # 5. Modulation Parameters
@@ -1669,6 +1775,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="patchify_proj",
         )
         self.audio_patchify_proj = ColumnParallelLinear(
             arch.audio_in_channels,
@@ -1676,6 +1783,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="audio_patchify_proj",
         )
 
         # Marks single-pixel-frame keyframe tokens. Zero-initialized upstream
@@ -1692,10 +1800,16 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.audio_caption_projection: LTX2TextProjection | None = None
         if not arch.caption_proj_before_connector:
             self.caption_projection = LTX2TextProjection(
-                in_features=arch.caption_channels, hidden_size=self.hidden_size
+                in_features=arch.caption_channels,
+                hidden_size=self.hidden_size,
+                quant_config=quant_config,
+                prefix="caption_projection",
             )
             self.audio_caption_projection = LTX2TextProjection(
-                in_features=arch.caption_channels, hidden_size=self.audio_hidden_size
+                in_features=arch.caption_channels,
+                hidden_size=self.audio_hidden_size,
+                quant_config=quant_config,
+                prefix="audio_caption_projection",
             )
 
         # 3. Timestep Modulation Params and Embedding
@@ -1704,35 +1818,57 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             embedding_coefficient=adaln_embedding_coefficient(
                 arch.cross_attention_adaln
             ),
+            quant_config=quant_config,
+            prefix="adaln_single",
         )
         self.audio_adaln_single = LTX2AdaLayerNormSingle(
             self.audio_hidden_size,
             embedding_coefficient=adaln_embedding_coefficient(
                 arch.cross_attention_adaln
             ),
+            quant_config=quant_config,
+            prefix="audio_adaln_single",
         )
         self.prompt_adaln_single: LTX2AdaLayerNormSingle | None = None
         self.audio_prompt_adaln_single: LTX2AdaLayerNormSingle | None = None
         if arch.cross_attention_adaln:
             self.prompt_adaln_single = LTX2AdaLayerNormSingle(
-                self.hidden_size, embedding_coefficient=2
+                self.hidden_size,
+                embedding_coefficient=2,
+                quant_config=quant_config,
+                prefix="prompt_adaln_single",
             )
             self.audio_prompt_adaln_single = LTX2AdaLayerNormSingle(
-                self.audio_hidden_size, embedding_coefficient=2
+                self.audio_hidden_size,
+                embedding_coefficient=2,
+                quant_config=quant_config,
+                prefix="audio_prompt_adaln_single",
             )
 
         # Global Cross Attention Modulation Parameters
         self.av_ca_video_scale_shift_adaln_single = LTX2AdaLayerNormSingle(
-            self.hidden_size, embedding_coefficient=4
+            self.hidden_size,
+            embedding_coefficient=4,
+            quant_config=quant_config,
+            prefix="av_ca_video_scale_shift_adaln_single",
         )
         self.av_ca_a2v_gate_adaln_single = LTX2AdaLayerNormSingle(
-            self.hidden_size, embedding_coefficient=1
+            self.hidden_size,
+            embedding_coefficient=1,
+            quant_config=quant_config,
+            prefix="av_ca_a2v_gate_adaln_single",
         )
         self.av_ca_audio_scale_shift_adaln_single = LTX2AdaLayerNormSingle(
-            self.audio_hidden_size, embedding_coefficient=4
+            self.audio_hidden_size,
+            embedding_coefficient=4,
+            quant_config=quant_config,
+            prefix="av_ca_audio_scale_shift_adaln_single",
         )
         self.av_ca_v2a_gate_adaln_single = LTX2AdaLayerNormSingle(
-            self.audio_hidden_size, embedding_coefficient=1
+            self.audio_hidden_size,
+            embedding_coefficient=1,
+            quant_config=quant_config,
+            prefix="av_ca_v2a_gate_adaln_single",
         )
 
         # Output Layer Scale/Shift Modulation parameters
@@ -1873,7 +2009,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     ),
                     enable_packed_qkv_input_a2a=arch.enable_packed_qkv_input_a2a,
                     supported_attention_backends=self._supported_attention_backends,
-                    prefix=config.prefix,
+                    # Native module path so per-layer Comfy quant markers
+                    # (transformer_blocks.<idx>.<sub>) dispatch to each linear.
+                    prefix=f"transformer_blocks.{idx}",
                     quant_config=quant_config,
                 )
                 for idx in range(arch.num_layers)
@@ -1890,6 +2028,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="proj_out",
         )
 
         self.audio_norm_out = nn.LayerNorm(
@@ -1901,6 +2040,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="audio_proj_out",
         )
 
         self.out_channels_raw = arch.out_channels // (

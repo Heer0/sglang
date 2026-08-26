@@ -113,13 +113,22 @@ def pack_text_embeds_v2(
     dimension, zeroing out padded positions afterwards.
     """
 
-    variance = torch.mean(text_hidden_states**2, dim=2, keepdim=True)
-    normalized_hidden_states = text_hidden_states * torch.rsqrt(variance + eps)
-    normalized_hidden_states = normalized_hidden_states.flatten(2)
+    # SOMA spike: memory-efficient RMS-norm. The upstream version materialises
+    # ~4 full-size copies of the stacked [b, seq, hidden, num_layers] tensor
+    # (`**2`, `* rsqrt`, `zeros_like`, `where`), which OOMs the 16GB card during
+    # the gemma text-encode postprocess. Compute the variance chunked over the
+    # hidden dim and normalise/mask in-place so peak = one small chunk.
+    hidden_dim = text_hidden_states.size(2)
+    sum_sq = None
+    for chunk in torch.split(text_hidden_states, 512, dim=2):
+        part = chunk.pow(2).sum(dim=2, keepdim=True)
+        sum_sq = part if sum_sq is None else sum_sq.add_(part)
+    variance = sum_sq / hidden_dim
+    text_hidden_states = text_hidden_states.mul_(torch.rsqrt(variance + eps))
+    del variance, sum_sq
+    normalized_hidden_states = text_hidden_states.flatten(2)
     mask = attention_mask.bool().unsqueeze(-1)
-    return torch.where(
-        mask, normalized_hidden_states, torch.zeros_like(normalized_hidden_states)
-    )
+    return normalized_hidden_states.mul_(mask.to(normalized_hidden_states.dtype))
 
 
 def is_ltx23_native_variant(arch_config: object) -> bool:
