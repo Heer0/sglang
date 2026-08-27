@@ -1553,6 +1553,30 @@ class LTX2DenoisingStage(DenoisingStage):
     ) -> LTX2DenoisingContext:
         """Extend the base context with LTX-2 audio, SP, and TI2V state."""
         self._disable_cache_dit_for_request = batch.image_path is not None
+        # SOMA/disagg file mode: TimestepPreparationStage (encoder-affinity) set
+        # batch.scheduler, but that object is not serializable so it did not cross
+        # the encoder->denoiser hand-off. Rebuild it from this role's loaded
+        # scheduler module + the transferred sigmas, mirroring TimestepPrep.
+        if batch.scheduler is None and getattr(self, "scheduler", None) is not None:
+            from sglang.multimodal_gen.runtime.distributed import (
+                get_local_torch_device,
+            )
+            from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+                prepare_ltx2_mu,
+            )
+
+            sched = self.scheduler
+            if batch.sigmas is not None:
+                extra = {}
+                _, mu = prepare_ltx2_mu(batch, server_args)
+                if mu is not None:
+                    extra["mu"] = mu
+                sched.set_timesteps(
+                    sigmas=batch.sigmas, device=get_local_torch_device(), **extra
+                )
+                if getattr(batch, "timesteps", None) is None:
+                    batch.timesteps = sched.timesteps
+            batch.scheduler = sched
         base_ctx = super()._prepare_denoising_loop(batch, server_args)
         ctx = LTX2DenoisingContext(**base_ctx.to_kwargs())
         ctx.is_ltx23_variant = is_ltx23_native_variant(

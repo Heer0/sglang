@@ -1465,6 +1465,69 @@ class LayerwiseOffloadableModuleMixin:
             for name in names
         }
 
+    @torch.compiler.disable
+    def free_host_weights(self) -> None:
+        """One-shot teardown: release the GPU copies AND free the *host* (CPU/
+        pinned) master weights of every layerwise-managed layer, plus this
+        module's own parameters/buffers. For components not reused after their
+        stage (e.g. the text encoder) whose resident host weights would otherwise
+        starve the pod cgroup on shared nodes (reclaim/jitter). Tensors are
+        hollowed in place, so lingering references become empty shells rather than
+        keeping the memory alive. Irreversible for this instance.
+
+        NOTE (dead end, see memory soma-sglang-k3s-nondeterminism): does NOT free
+        the Gemma text-encoder RAM — its layer weights are mmap views into the
+        checkpoint file (file-backed), not anon, so hollowing refs + malloc_trim
+        only drops ~3 GiB. Real per-component memory release comes from the
+        disaggregation-by-role approach (soma-sglang-disagg-fichier), where the
+        process death frees everything. Kept opt-in behind SOMA_FREE_TEXT_ENCODER."""
+        import gc
+
+        for manager in list(getattr(self, "layerwise_offload_managers", []) or []):
+            try:
+                manager.release_all()
+            except Exception:
+                pass
+            for attr in (
+                "_mapped_cpu_weights",
+                "_weight_metadata",
+                "_named_parameters",
+                "_named_buffers",
+            ):
+                store = getattr(manager, attr, None)
+                if hasattr(store, "clear"):
+                    try:
+                        store.clear()
+                    except Exception:
+                        pass
+            manager.enabled = False
+
+        with torch.inference_mode(False), torch.no_grad():
+            for p in self.parameters(recurse=True):
+                p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+            for b in self.buffers(recurse=True):
+                b.data = torch.empty(0, dtype=b.dtype, device=b.device)
+
+        self.layerwise_offload_managers = []
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        host_empty = getattr(torch._C, "_host_emptyCache", None)
+        if callable(host_empty):
+            try:
+                host_empty()
+            except Exception:
+                pass
+        # Freed CPU tensors sit in glibc's arenas (not returned to the OS), so
+        # the cgroup RSS stays high until we trim. This is what actually drops
+        # memory.current after the release.
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
     def park_non_layer_weights(self) -> None:
         """Move the parameters no manager streams back to the host.
 

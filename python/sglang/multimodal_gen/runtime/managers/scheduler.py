@@ -303,7 +303,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
 
             if len(reqs) == 1 or not allow_dynamic_batching:
-                return self.worker.execute_forward(reqs)
+                # SOMA file mode: load a prior role's conditioning before the
+                # stages, dump this role's conditioning after (one-shot hand-off
+                # via .bin instead of the pool transport). No-op unless the
+                # SOMA_LOAD_PAYLOAD / SOMA_DUMP_PAYLOAD env vars are set.
+                from sglang.multimodal_gen.runtime.disaggregation.soma_payload_io import (
+                    maybe_dump_payload,
+                    maybe_load_payload,
+                )
+
+                maybe_load_payload(reqs[0])
+                out = self.worker.execute_forward(reqs)
+                maybe_dump_payload(reqs[0])
+                return out
 
             if self.server_args.pipeline_config.supports_native_grouped_requests():
                 return self._execute_generation_grouped(reqs)
@@ -1176,8 +1188,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
-        # Pool mode: all roles use the pool event loop
-        if self._disagg_role != RoleType.MONOLITHIC:
+        # Pool mode: all roles use the pool event loop, EXCEPT SOMA file mode,
+        # which runs the normal one-shot loop with only its role's components and
+        # stages loaded (hand-off via .bin file instead of the pool transport).
+        if self._disagg_role != RoleType.MONOLITHIC and not getattr(
+            self, "_disagg_file_mode", False
+        ):
             self._disagg_event_loop()
             return
 

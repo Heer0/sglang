@@ -225,6 +225,31 @@ class LTX2SigmaPreparationStage(PipelineStage):
         return batch
 
 
+class _LTX2FreeTextEncoderStage(PipelineStage):
+    """Frees the text encoder's host RAM once encoding + connector are done.
+
+    Opt-in via ``SOMA_FREE_TEXT_ENCODER``. The encoder is not used during
+    denoising, so its ~15 GB of resident/pinned host weights are dead weight
+    that starves the pod cgroup on shared nodes (reclaim/jitter → non-determinism).
+    Hollows the module in place, so the lingering TextEncodingStage reference
+    becomes an empty shell rather than keeping the memory alive.
+    """
+
+    def __init__(self, pipeline: ComposedPipelineBase):
+        super().__init__()
+        self._pipeline = pipeline
+
+    def forward(self, batch: Req, server_args) -> Req:
+        enc = self._pipeline.get_module("text_encoder", None)
+        if enc is not None and hasattr(enc, "free_host_weights"):
+            enc.free_host_weights()
+            try:
+                self._pipeline.modules["text_encoder"] = None
+            except Exception:
+                pass
+        return batch
+
+
 def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
     pipeline.add_stages(
         [
@@ -236,6 +261,10 @@ def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
             LTX2TextConnectorStage(connectors=pipeline.get_module("connectors")),
         ]
     )
+    # Free the text encoder's host RAM here (opt-in): it is done being used, and
+    # keeping its ~15 GB pinned starves the pod cgroup during denoising.
+    if os.environ.get("SOMA_FREE_TEXT_ENCODER"):
+        pipeline.add_stage(_LTX2FreeTextEncoderStage(pipeline))
     # Must run before latent preparation, which derives shapes from
     # `num_frames`. A no-op unless the request sets `auto_duration`.
     duration_head = pipeline.get_module("duration_head", None)

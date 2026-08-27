@@ -13,6 +13,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -403,12 +404,29 @@ class SchedulerDisaggMixin:
         self._compute_ready_queue = None
         self._recv_prefetch_thread = None
 
+        # SOMA file mode: a single role runs standalone one-shot and hands off via
+        # a .bin file (pack_tensors) instead of the ZMQ/Mooncake server transport.
+        # Keeps the role's partial component load + stage filtering, drops the
+        # DiffusionServer-mediated sockets/transfer + pool event loop.
+        self._disagg_file_mode = bool(
+            os.environ.get("SOMA_DUMP_PAYLOAD") or os.environ.get("SOMA_LOAD_PAYLOAD")
+        )
+
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
-            device = torch.device(f"{current_platform.device_type}:{local_rank}")
-            self._transfer_stream = torch.get_device_module().Stream(device=device)
-            self._init_disagg_sockets()
-            self._init_disagg_transfer_manager()
+            if self._disagg_file_mode:
+                logger.info(
+                    "Disagg %s: SOMA FILE mode — standalone one-shot, skipping ZMQ "
+                    "sockets + transfer manager (dump=%s load=%s)",
+                    self._disagg_role.value,
+                    os.environ.get("SOMA_DUMP_PAYLOAD"),
+                    os.environ.get("SOMA_LOAD_PAYLOAD"),
+                )
+            else:
+                device = torch.device(f"{current_platform.device_type}:{local_rank}")
+                self._transfer_stream = torch.get_device_module().Stream(device=device)
+                self._init_disagg_sockets()
+                self._init_disagg_transfer_manager()
 
     def _init_disagg_sockets(self: Scheduler):
         """Initialize ZMQ sockets for disaggregated mode (DiffusionServer-mediated).
