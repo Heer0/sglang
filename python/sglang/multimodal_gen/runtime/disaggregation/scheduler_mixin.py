@@ -77,6 +77,9 @@ _EXCLUDE_FIELDS = frozenset(
         "generator",
         "modules",
         "metrics",
+        # per-role local: the perf-dump target must not ride the payload to the
+        # next role (see _SAMPLING_PARAMS_EXCLUDE_FIELDS for the full rationale).
+        "perf_dump_path",
         "extra_step_kwargs",
         "extra",
         "condition_image",
@@ -114,6 +117,21 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
         "data_type",
         "supported_resolutions",
         "teacache_params",
+        # Output naming is a per-role local concern: each role decides where ITS
+        # output goes. Left in, the encoder's prompt-derived output_file_name
+        # crosses the hop and overrides the decoder's --output-file-path.
+        "output_file_name",
+        "output_path",
+        # Same class: the perf-dump target is per-role. Left in, the encoder's
+        # --perf-dump-path rides the payload to every later role, so they all
+        # dump into encoder.json and their own files are never written.
+        "perf_dump_path",
+        # Same class: output encoding is the DECODER's concern. Left in, the
+        # encoder's default (compression 50) rides the payload and overrides the
+        # decoder's --output-quality/--output-compression — so the mp4 always
+        # encodes at 50 regardless, byte-identical across quality settings.
+        "output_quality",
+        "output_compression",
     }
 )
 

@@ -60,6 +60,11 @@ class RequestMetrics:
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
+        # Offload accounting snapshot, attached in the GPU worker where the
+        # offload managers live, so it rides back to the parent with the rest
+        # of the metrics (the offload_stats singleton is per-process and would
+        # read empty in the parent otherwise).
+        self.offload: Dict[str, Any] = {}
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
@@ -91,6 +96,7 @@ class RequestMetrics:
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "offload": self.offload,
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()

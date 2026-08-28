@@ -73,6 +73,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers import offload_stats
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -529,8 +530,40 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     raise
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
-            # before converting it to OutputBatch
+            # before converting it to OutputBatch. Intermediate roles (encoder,
+            # denoiser) exit HERE — before the metrics finalization + perf dump
+            # below — so without this block they never record their own timings,
+            # memory, or offload volume. Finalize and dump them in place.
             if return_req and isinstance(result, Req):
+                metrics = getattr(result, "metrics", None)
+                if (
+                    self.is_output_rank
+                    and metrics is not None
+                    and not current_platform.is_cpu()
+                ):
+                    metrics.record_memory_snapshot(
+                        "after_forward", capture_memory_snapshot()
+                    )
+                    metrics.total_duration_ms = (time.monotonic() - start_time) * 1000
+                    metrics.offload = offload_stats.snapshot()
+                if (
+                    getattr(req, "perf_dump_path", None) is not None
+                    and not getattr(req, "is_warmup", False)
+                    and metrics is not None
+                ):
+                    PerformanceLogger.log_request_summary(metrics=metrics)
+                    PerformanceLogger.dump_benchmark_report(
+                        file_path=req.perf_dump_path,
+                        metrics=metrics,
+                        meta={
+                            "model": self.server_args.model_path,
+                            "role": str(
+                                getattr(self.server_args, "disagg_role", "")
+                            ),
+                            "offload": metrics.offload,
+                        },
+                        tag="server_perf_dump_role",
+                    )
                 return result
 
             output_batch = self._to_output_batch(result)
@@ -542,8 +575,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     metrics.record_memory_snapshot("after_forward", peak_snapshot)
 
             duration_ms = (time.monotonic() - start_time) * 1000
+            offload_snapshot = offload_stats.snapshot()
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
+                # ride the offload snapshot back to the parent with the metrics
+                metrics.offload = offload_snapshot
 
             self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch)
@@ -582,7 +618,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 PerformanceLogger.dump_benchmark_report(
                     file_path=req.perf_dump_path,
                     metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
+                    meta={
+                        "model": self.server_args.model_path,
+                        "role": str(getattr(self.server_args, "disagg_role", "")),
+                        "offload": getattr(output_batch.metrics, "offload", {}),
+                    },
                     tag="server_perf_dump",
                 )
         except Exception as e:

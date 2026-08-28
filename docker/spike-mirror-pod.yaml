@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ltx-spike-mirror
+  namespace: soma
+spec:
+  restartPolicy: Never
+  schedulerName: hami-scheduler
+  runtimeClassName: nvidia
+  nodeSelector: { workload: gpu-worker }
+  tolerations: [ { key: dedicated, operator: Equal, value: gpu, effect: NoSchedule } ]
+  containers:
+    - name: sglang
+      image: lmsysorg/sglang:latest
+      command: ["sleep", "infinity"]
+      env:
+        - { name: HOME, value: "/data/spike" }
+        - { name: HF_HOME, value: "/data/huggingface" }
+        - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
+      resources:
+        requests: { nvidia.com/gpumem: "15000", nvidia.com/gpucores: "80", memory: "12Gi", cpu: "2" }
+        limits:   { nvidia.com/gpumem: "15000", nvidia.com/gpucores: "80", memory: "40Gi", cpu: "8" }
+      volumeMounts:
+        - { name: cache, mountPath: /data }
+        - { name: code, mountPath: /sgl-workspace/sglang/python/sglang, readOnly: true }
+  volumes:
+    - { name: cache, persistentVolumeClaim: { claimName: soma-video-ltx-cache } }
+    - { name: code, hostPath: { path: /home/heero/Projects/sglang/python/sglang, type: Directory } }

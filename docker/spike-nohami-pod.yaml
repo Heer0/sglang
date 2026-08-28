@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ltx-spike-nohami
+  namespace: soma
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  nodeSelector: { workload: gpu-worker }
+  tolerations: [ { key: dedicated, operator: Equal, value: gpu, effect: NoSchedule } ]
+  containers:
+    - name: sglang
+      image: lmsysorg/sglang:latest
+      command: ["sleep", "infinity"]
+      env:
+        - { name: HOME, value: "/data/spike" }
+        - { name: HF_HOME, value: "/data/huggingface" }
+        - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
+        - { name: NVIDIA_VISIBLE_DEVICES, value: "all" }
+      resources:
+        requests: { nvidia.com/gpu: "1", memory: "12Gi", cpu: "2" }
+        limits:   { nvidia.com/gpu: "1", memory: "36Gi", cpu: "8" }
+      volumeMounts:
+        - { name: cache, mountPath: /data }
+  volumes:
+    - { name: cache, persistentVolumeClaim: { claimName: soma-video-ltx-cache } }

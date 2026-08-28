@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers import offload_stats
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -970,9 +971,15 @@ class LayerwiseOffloadManager:
             self._mapped_cpu_weights.get(layer_idx)
         ):
             return
+        _soma_start_evt = None
         if self.copy_stream is not None:
             self.copy_stream.wait_stream(torch.get_device_module().current_stream())
             stream_context = torch.get_device_module().stream(self.copy_stream)
+            if offload_stats.PROFILE:
+                # opt-in: bracket this layer's copies with timing events on the
+                # copy stream; summed at report time when the device is idle.
+                _soma_start_evt = torch.get_device_module().Event(enable_timing=True)
+                _soma_start_evt.record(self.copy_stream)
         else:
             # the device has no CUDA-like stream or pinned-memory support
             non_blocking = False
@@ -1051,9 +1058,17 @@ class LayerwiseOffloadManager:
 
         if self.copy_stream is not None:
             # record after all copies so the consumer waits for every weight copy
-            event = torch.get_device_module().Event()
+            event = torch.get_device_module().Event(enable_timing=offload_stats.PROFILE)
             event.record(self.copy_stream)
             self._prefetch_events[layer_idx] = event
+            if offload_stats.PROFILE:
+                offload_stats.record_pair(_soma_start_evt, event)
+
+        # H2D volume for this layer (B, always-on): pure Python, off the CUDA
+        # path — covers every hosting route since it reads shape+dtype.
+        meta_map = self._weight_metadata.get(layer_idx)
+        if meta_map:
+            offload_stats.add_layer(meta_map.values())
 
         if not ship_mapped:
             self._gpu_layers.add(layer_idx)
@@ -1867,6 +1882,19 @@ class LayerwiseOffloadableModuleMixin:
             resident_layers,
             total_layers,
             policies,
+        )
+        # Surface the offload config in the perf report (A). One role/process.
+        from sglang.multimodal_gen.runtime.managers.memory_managers import (
+            offload_stats,
+        )
+
+        offload_stats.register_config(
+            component=str(component_label),
+            groups=len(managers),
+            total_layers=total_layers,
+            resident_layers=resident_layers,
+            prefetch_per_group=prefetch_sizes,
+            policy=policies,
         )
 
     def prepare_for_next_req(self):

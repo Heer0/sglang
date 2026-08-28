@@ -860,6 +860,11 @@ def _try_save_video_with_audio(
             format=output_format,
             codec="libx264",
             quality=quality,
+            # SOMA: libx264 ignores imageio's `quality` (-qscale), so derive a
+            # real -crf from output_compression (via quality): 100 -> crf 0
+            # (lossless), 50 -> crf ~25. Without this every mp4 was silently
+            # stuck at libx264's default CRF regardless of --output-quality.
+            output_params=["-crf", str(int((1 - quality / 10.0) * 51))],
             audio_path=tmp_wav_path,
             audio_codec="aac",
         )
@@ -1082,6 +1087,9 @@ def save_materialized_output(
                 format=output_format,
                 codec="libx264",
                 quality=quality,
+                # SOMA: real -crf from output_compression (libx264 ignores
+                # `quality`). See the audio path above for the mapping.
+                output_params=["-crf", str(int((1 - quality / 10.0) * 51))],
             )
 
             _maybe_mux_audio_into_mp4(

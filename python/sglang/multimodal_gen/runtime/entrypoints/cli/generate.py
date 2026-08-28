@@ -137,8 +137,16 @@ def maybe_dump_performance(
             reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
             peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
             peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
+            # peak_host_anon_mb (RssAnon high-water) is the host-RAM budget cost
+            # — the metric that proves a disaggregated role holds only ONE
+            # component resident. Dropping it here blanked it in every dump.
+            peak_host_anon_mb=snapshot_dict.get("peak_host_anon_mb", 0.0),
         )
         metrics.memory_snapshots[checkpoint_name] = snapshot
+
+    # Offload rode back inside the metrics from the GPU worker (its offload_stats
+    # singleton is empty in this parent process), so read it from the dict.
+    metrics.offload = metrics_dict.get("offload", {}) or {}
 
     PerformanceLogger.dump_benchmark_report(
         file_path=args.perf_dump_path,
@@ -146,6 +154,8 @@ def maybe_dump_performance(
         meta={
             "prompt": prompt,
             "model": server_args.model_path,
+            "role": str(getattr(server_args, "disagg_role", "")),
+            "offload": metrics.offload,
         },
         tag="cli_generate",
     )

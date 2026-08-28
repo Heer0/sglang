@@ -13,7 +13,20 @@ WIDTH="${WIDTH:-832}"; HEIGHT="${HEIGHT:-480}"; FRAMES="${FRAMES:-49}"
 STEPS="${STEPS:-8}"; SEED="${SEED:-42}"
 OUT="${OUT:-/data/spike/out/optimized}"
 TMP="${TMP:-/data/spike/out/tmp_$$}"
-mkdir -p "$TMP" "$(dirname "$OUT")"
+REPORTS="${REPORTS:-$(dirname "$OUT")/perf_$$}"
+# The perf report has no generation-time cost (a separate python process on the
+# tiny JSONs, after the run); SOMA_REPORT=0 skips it anyway. It ships inside the
+# package (rides the existing fork mount) and is invoked with `python3 -m`, so
+# no extra mount is needed. SOMA_PERF_REPORT=<file> forces a specific script.
+SOMA_REPORT="${SOMA_REPORT:-1}"
+# The aggregator lives in the fork tree (rides the existing python mount) and is
+# stdlib-only, so it is run BY PATH — not `python3 -m`, which would import the
+# whole sglang/CUDA package just to print a table. SOMA_PERF_REPORT overrides.
+REPORT_PY="${SOMA_PERF_REPORT:-/sgl-workspace/sglang/python/sglang/multimodal_gen/runtime/disaggregation/soma_perf_report.py}"
+# In a container $$ is always 1, so perf_$$ is reused across runs — a prior
+# run's per-role JSONs would linger and get mixed in. Start from a clean dir.
+rm -rf "$REPORTS"
+mkdir -p "$TMP" "$REPORTS" "$(dirname "$OUT")"
 trap 'rm -f "$TMP"/embeds.bin "$TMP"/latents.bin; rmdir "$TMP" 2>/dev/null || true' EXIT
 
 COMMON=(
@@ -25,18 +38,53 @@ COMMON=(
   --dit-layerwise-offload --dit-offload-prefetch-size 0
 )
 
+# Per-role extra flags, appended AFTER COMMON so they override it (argparse:
+# last wins). This is the tuning lever the report exposes — e.g. keep DiT layers
+# resident instead of re-streaming all 48 every step:
+#   EXTRA_DENOISER="--dit-layerwise-resident-layers 40 --dit-offload-prefetch-size 2"
+# Optionally SageAttention:  --attention-backend sage_attn
+# Word-split on purpose (these are CLI flags, no globs).
+EXTRA_ENCODER="${EXTRA_ENCODER:-}"
+EXTRA_DENOISER="${EXTRA_DENOISER:-}"
+EXTRA_DECODER="${EXTRA_DECODER:-}"
+
+# wall-clock (load + inference) per role; the JSON carries pure inference time,
+# so wall - infer = the per-role model-load cost. `SECONDS` resets before each.
 echo "=================== [1/3] ENCODER (Gemma only) ==================="
+SECONDS=0
 SOMA_DUMP_PAYLOAD="$TMP/embeds.bin" \
   sglang generate --disagg-role encoder "${COMMON[@]}" \
-  --layerwise-offload-components text_encoder
+  --layerwise-offload-components text_encoder \
+  --perf-dump-path "$REPORTS/encoder.json" $EXTRA_ENCODER
+ENC_WALL=$SECONDS
 
 echo "=================== [2/3] DENOISER (DiT only) ==================="
+SECONDS=0
 SOMA_LOAD_PAYLOAD="$TMP/embeds.bin" SOMA_DUMP_PAYLOAD="$TMP/latents.bin" \
-  sglang generate --disagg-role denoiser "${COMMON[@]}"
+  sglang generate --disagg-role denoiser "${COMMON[@]}" \
+  --perf-dump-path "$REPORTS/denoiser.json" $EXTRA_DENOISER
+DEN_WALL=$SECONDS
 
 echo "=================== [3/3] DECODER (VAE only) -> mp4 ==================="
+SECONDS=0
 SOMA_LOAD_PAYLOAD="$TMP/latents.bin" \
   sglang generate --disagg-role decoder "${COMMON[@]}" \
-  --output-file-path="$OUT" --save-output
+  --output-file-path="$OUT" --save-output \
+  --perf-dump-path "$REPORTS/decoder.json" $EXTRA_DECODER
+DEC_WALL=$SECONDS
 
 echo "=================== DONE: ${OUT}.mp4 ==================="
+# The mp4 is the deliverable; never let the report step fail the run (|| true).
+ARGS=(
+  "${OUT}.report.json"
+  "encoder:$REPORTS/encoder.json:$ENC_WALL"
+  "denoiser:$REPORTS/denoiser.json:$DEN_WALL"
+  "decoder:$REPORTS/decoder.json:$DEC_WALL"
+)
+if [ "$SOMA_REPORT" != "1" ]; then
+  echo "perf report disabled (SOMA_REPORT=$SOMA_REPORT). JSONs in $REPORTS"
+elif [ -f "$REPORT_PY" ]; then
+  python3 "$REPORT_PY" "${ARGS[@]}" || true
+else
+  echo "perf report skipped: $REPORT_PY introuvable (set SOMA_PERF_REPORT). JSONs in $REPORTS"
+fi

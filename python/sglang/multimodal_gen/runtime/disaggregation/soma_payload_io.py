@@ -100,7 +100,11 @@ def load_file_into_req(req, path: str, device: str = "cpu") -> None:
         "output_file_path",
         "output_file_paths",
         "output_path",
+        "output_file_name",
         "save_output",
+        "perf_dump_path",
+        "output_quality",
+        "output_compression",
     }
     for k, v in scalar_fields.items():
         if k in _KEEP_LOCAL:
