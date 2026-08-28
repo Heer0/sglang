@@ -28,7 +28,7 @@ export PVC=/var/lib/rancher/k3s/storage/pvc-716616bd-568b-45a2-badd-1b1541e7d93f
 ## Commande de base (standard)
 
 ```bash
-sudo k3s ctr -n k8s.io run --rm --gpus 0 \
+sudo k3s ctr -n k8s.io run --rm --gpus 0 --memory-limit 32212254720 \
   --env HF_HUB_OFFLINE=1 \
   --env HOME=/data/spike --env HF_HOME=/data/huggingface \
   --env SOMA_FFN_CHUNK=1024 \
@@ -217,15 +217,48 @@ et `sudo grep diffusion_decoder $D/model_index.json` la classe.
   ignore le `quality`=`-qscale` d'imageio → CRF 23 figé). Le save est **hardcodé
   lossless (`-crf 0`)** dans le fork ([utils.py](../python/sglang/multimodal_gen/runtime/entrypoints/utils.py),
   2 chemins). Gain = couleurs, pas piqué. À recâbler sur `output_compression` un jour.
-- **Orbe / freeze** = pression mémoire (cgroup kubelet ou RAM épinglée), **pas** le
-  prompt ni la réso. Résolu par la désagrégation (working set borné). Sur nœud
-  partagé, garder les caps VRAM et resident bas.
+- **🐛 ORBE = sglang DÉTECTE un cgroup (cause racine, enfin isolée).** Ce n'est
+  ni kubelet, ni le reclaim, ni la valeur du cap. Isolé empiriquement : même
+  `memory.max` (30 Gio, enforced côté hôte), **seul le fait que l'offload *lise*
+  le cap change tout** :
+  - `--memory-limit` **sans** mount `/sys/fs/cgroup` → cgroup **non détecté**
+    (mount conteneur masqué) → offload budgète contre la RAM libre → **toutes les
+    couches pinned** → **net, quelle que soit la valeur.**
+  - cgroup **détecté** (mount, ou **pod k8s où kubelet l'expose**) → `HostPinBudget`
+    lit `available = min(RAM libre, cap − usage)` → budget serré → les couches qui
+    "ne rentrent pas" partent sur le chemin **mapped** (`MappedLayerCourier`, mmap +
+    collecte **async**) → ce chemin dégrade (poids pas prêts au calcul) → **orbe.**
+  Le mécanisme est dans [layerwise_offload.py](../python/sglang/multimodal_gen/runtime/managers/memory_managers/layerwise_offload.py)
+  (`HostPinBudget` :380, `available_host_memory`, `_plan_layer_hosting`, `MappedLayerCourier` :197).
+- **🛡️ Garde-fou mémoire = `--memory-limit 32212254720`** (30 Gio), **SANS mount
+  cgroup**. OOM-kill le runaway (ex. diff decoder ~45 Go) au lieu de figer la box →
+  worst case `Exit -9`, jamais un reboot. Enforce côté hôte ; l'offload ne le
+  **détecte pas** (`... (no cgroup cap)` dans le log) → **c'est justement ce qu'on
+  veut** : protection SANS déclencher l'orbe. **Ne JAMAIS** ajouter
+  `--mount .../sys/fs/cgroup` en prod (ça rendrait le cap détectable → orbe).
+  Cleanup orphelins post-OOM (SIGKILL ne déclenche pas `--rm`) :
+  `for k in task container snapshot; do sudo k3s ctr -n k8s.io $k rm <id>; done`.
+- **⚠️ Déploiement k8s (Soma)** : en vrai pod, **kubelet EXPOSE le cgroup** → sglang
+  le détecte → **orbes reviennent**. Fix requis avant prod : (a) corriger le chemin
+  mapped (`MappedLayerCourier`) pour qu'il soit correct/synchrone, ou (b) rendre
+  l'offload aveugle au cgroup (toujours pinner, le cap host gère l'OOM), ou (c) pod
+  limit assez haute pour que tout tienne en pinned (pas de mapped).
 - **Steps distillé** : `--num-inference-steps` est **ignoré** (schedule sigma figé 8).
   Le compteur `denoise Nx` du report le confirme. Monter les steps = mode **dev**.
 - **Dev** : `--model-variant dev` → `transformer_full/`, + CFG + 25-30 steps. Plafond
   qualité supérieur mais ~7× plus lent. `dev à 8 steps < distillé à 8 steps` (sous-convergé).
-- **sage_attn / resident** = leviers **vitesse/VRAM**, pas qualité. Le denoise étant
-  compute-bound, ils ne bougent pas le ms/step ici.
+- **⚡ SageAttention = ~36% plus rapide sur le denoise (MESURÉ, clips longs).**
+  A/B à 1920×1088×**121 frames** : FA 15424 ms/step → sage 9803 ms/step (−36%),
+  qualité préservée. Le gain **croît avec la durée** (attention O(N²)) → négligeable
+  sur du 49f, gros sur du long. Auto-activé par le `.sh` (`SAGE=1`) quand le paquet
+  est sur le PVC (`/data/sage-pkgs`, SageAttention 2.2.0 compilé cu130/sm89) ;
+  sinon sglang retombe **silencieusement** sur Flash Attention (vérifier le log :
+  `Attention backends for transformer: fa` = Sage PAS actif). `SAGE=0` pour couper.
+  Installation (une fois, sur un cluster neuf) : `pip install --target=/data/sage-pkgs
+  --no-deps --no-build-isolation git+https://github.com/thu-ml/SageAttention.git@d9704247…`
+  dans un conteneur de l'image (a nvcc/torch/ninja), `--net-host` pour cloner.
+- **`resident_layers`** = levier VRAM↔trafic, **pas** vitesse (le denoise est
+  compute-bound côté matmuls W4A8 ; le streaming est déjà caché). Laisser à 0.
 
 ---
 

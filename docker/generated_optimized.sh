@@ -35,14 +35,38 @@ COMMON=(
   --prompt="$PROMPT" --width="$WIDTH" --height="$HEIGHT" --num-frames="$FRAMES"
   --num-inference-steps="$STEPS" --seed="$SEED" --num-gpus=1
   --cpu-offload-components connectors vae vocoder audio_vae
-  --dit-layerwise-offload --dit-offload-prefetch-size 0
 )
+
+# DIT_OFFLOAD=1 (défaut) : layerwise offload du DiT (stream, VRAM mini, mais RAM
+#   CPU pinned/mapped → sujet au bug cgroup). DIT_OFFLOAD=0 : DiT RÉSIDENT en VRAM
+#   (rentre en disagg car le denoiser est seul ; pas de RAM CPU → esquive le bug
+#   cgroup, et plus rapide car zéro H2D). N'affecte que le denoiser (seul à charger
+#   le transformer ; encoder/decoder le skippent).
+DIT_OFFLOAD="${DIT_OFFLOAD:-1}"
+if [ "$DIT_OFFLOAD" = "1" ]; then
+  COMMON+=(--dit-layerwise-offload --dit-offload-prefetch-size 0)
+fi
+
+# SageAttention sur le DENOISER (attention quantifiée/fusionnée). MESURÉ ~36%
+# plus rapide à 1920x1088x121 (15424 -> 9803 ms/step), qualité préservée ; le
+# gain croît avec la durée (attention O(N²)). Le paquet compilé (2.2.0, cu130/
+# sm89) vit sur le PVC en /data/sage-pkgs → exposé via PYTHONPATH. Sans lui,
+# sglang retombe silencieusement sur Flash Attention. SAGE=0 pour couper.
+SAGE="${SAGE:-1}"
+SAGE_PKGS="${SAGE_PKGS:-/data/sage-pkgs}"
+SAGE_ARGS=()
+if [ "$SAGE" = "1" ] && [ -d "$SAGE_PKGS" ]; then
+  export PYTHONPATH="$SAGE_PKGS${PYTHONPATH:+:$PYTHONPATH}"
+  SAGE_ARGS=(--attention-backend sage_attn)
+  echo "SageAttention ON (denoiser) — PYTHONPATH=$SAGE_PKGS"
+elif [ "$SAGE" = "1" ]; then
+  echo "SAGE=1 mais $SAGE_PKGS absent → Flash Attention (installer SageAttention sur le PVC)"
+fi
 
 # Per-role extra flags, appended AFTER COMMON so they override it (argparse:
 # last wins). This is the tuning lever the report exposes — e.g. keep DiT layers
 # resident instead of re-streaming all 48 every step:
 #   EXTRA_DENOISER="--dit-layerwise-resident-layers 40 --dit-offload-prefetch-size 2"
-# Optionally SageAttention:  --attention-backend sage_attn
 # Word-split on purpose (these are CLI flags, no globs).
 EXTRA_ENCODER="${EXTRA_ENCODER:-}"
 EXTRA_DENOISER="${EXTRA_DENOISER:-}"
@@ -61,7 +85,7 @@ ENC_WALL=$SECONDS
 echo "=================== [2/3] DENOISER (DiT only) ==================="
 SECONDS=0
 SOMA_LOAD_PAYLOAD="$TMP/embeds.bin" SOMA_DUMP_PAYLOAD="$TMP/latents.bin" \
-  sglang generate --disagg-role denoiser "${COMMON[@]}" \
+  sglang generate --disagg-role denoiser "${COMMON[@]}" "${SAGE_ARGS[@]}" \
   --perf-dump-path "$REPORTS/denoiser.json" $EXTRA_DENOISER
 DEN_WALL=$SECONDS
 
