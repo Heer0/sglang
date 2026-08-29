@@ -433,6 +433,13 @@ class LTX2VideoVaeNeighborhoodAttention(nn.Module):
         if na3d is not None:
             # `project_qkv` already yields NATTEN's layout. scale=1.0: the
             # query is pre-scaled there.
+            # NATTEN requires q/k/v to share a dtype. norm_q/norm_k + RoPE
+            # promote query/key to fp32 while value stays in the model dtype,
+            # so realign to value's dtype (FlexAttention tolerated the mix;
+            # NATTEN raises). bf16 is the model's compute dtype → no real loss.
+            if query.dtype != value.dtype:
+                query = query.to(value.dtype)
+                key = key.to(value.dtype)
             hidden_states = na3d(
                 query, key, value, kernel_size=self.kernel_size, scale=1.0
             )

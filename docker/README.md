@@ -83,15 +83,29 @@ sudo k3s ctr -n k8s.io run --rm --gpus 0 \
   docker.io/library/sglang-fork:spike ltxquick bash /generated_optimized.sh
 ```
 
-### ✨ Qualité — décodeur de diffusion  ⚠️ TESTÉ, ÉCARTÉ
+### ✨ Qualité — décodeur de diffusion  ✅ VIABLE avec NATTEN
 
-> **Verdict (mesuré) : non-rentable sur cette machine.** Le VAE classique rend
-> déjà le détail fin (pores, taches de rousseur, cils, cheveux — vérifié sur un
-> visage en gros plan). Le diff decoder n'ajoute rien de visible sur du vrai
-> contenu, coûte **~300 s de decode** (attention de voisinage sur fallback
-> FlexAttention, pas de NATTEN) et **~45 Go de RAM d'un coup** (stages 1-3 non
-> tuilés → swap/freeze en haute réso). **NATTEN ne le sauverait pas** : il règle
-> la vitesse, pas les 45 Go d'activations (mur séparé). À oublier ; garde le VAE.
+> **Verdict (mesuré, corrigé) : chemin qualité pour la haute réso.** L'ancien
+> verdict "impasse 45 Go / 300 s" était faux — les 300 s / 45 Go étaient le
+> **fallback FlexAttention** (construction du masque de voisinage), PAS le
+> décodeur. Avec **NATTEN** installé (`na3d`), le decode retombe à quelques
+> secondes et une VRAM normale. Il fallait aussi un **fix dtype** (q/k promus
+> fp32 par norm+RoPE alors que v reste bf16 → `na3d` exige un dtype uniforme ;
+> réaligné sur v).
+>
+> Gain qualité : **léger** à 480p (sharpness à peine perceptible sur un visage
+> en gros plan), mais il **croît avec la résolution** — plus le VAE compresse de
+> hautes fréquences (1080p, 2k), plus le diff decoder a de matière à
+> resynthétiser. C'est donc un **outil de rendu final haute-réso**, pas un défaut
+> quotidien (coûte ~2× le decode + dépendance NATTEN).
+>
+> ⚠️ **Caveat 2k** : le tiling est **partiel** — `forward_stages_1_to_3`
+> ([ltx_2_5_diffusion_decoder.py:977](../python/sglang/multimodal_gen/runtime/models/decoders/ltx_2_5_diffusion_decoder.py#L977))
+> tourne sur le **volume entier** avant la boucle de tuiles ; seuls les stages 4+
+> sont tuilés. À 2k, ces 3 premiers stages non-tuilés seront le mur VRAM
+> (chantier : les tuiler ou les offloader). Le VAE tuile tout, d'où sa frugalité.
+>
+> Prérequis : `pip install natten` dans l'image (roue compilée cp312/cu13x).
 
 Remplace le décodeur VAE par le décodeur génératif LTX (synthétise le haut-fréquence
 → piqué à résolution constante). **Même denoise, mêmes latents, seul le decode change.**
@@ -210,9 +224,11 @@ et `sudo grep diffusion_decoder $D/model_index.json` la classe.
 - **✅ Config workhorse = distillé + VAE + lossless.** Net, rapide, mémoire-safe.
   Le VAE rend déjà le détail fin (vérifié sur visage : pores, taches de rousseur,
   cils). Le "flou" perçu était **le contenu** (méduse = sujet doux), pas le modèle.
-- **Testés et écartés sur cette machine** : décodeur de diffusion (45 Go RAM +
-  300 s, aucun gain vs VAE), NATTEN (ne règle que la vitesse du diff decoder, pas
-  sa mémoire), mode dev (7× plus lent). Aucun n'est nécessaire.
+- **✅ Décodeur de diffusion = VIABLE avec NATTEN** (voir section dédiée). Le
+  "45 Go / 300 s" était le fallback FlexAttention, pas le décodeur ; NATTEN +
+  fix dtype → decode en secondes, VRAM normale. Gain qualité léger à 480p, qui
+  **croît en réso** → chemin rendu final 1080p/2k. Caveat : stages 1-3 non tuilés.
+- **Écarté sur cette machine** : mode dev (7× plus lent).
 - **Codec** : `output_quality`/`--output-compression` étaient **inopérants** (libx264
   ignore le `quality`=`-qscale` d'imageio → CRF 23 figé). Le save est **hardcodé
   lossless (`-crf 0`)** dans le fork ([utils.py](../python/sglang/multimodal_gen/runtime/entrypoints/utils.py),
