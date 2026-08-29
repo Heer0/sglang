@@ -103,15 +103,50 @@ def _cgroup_dirs(mount: str) -> list[str]:
     return dirs
 
 
+def _cgroup_reclaimable_file_bytes(directory: str, is_v2: bool) -> int:
+    """The file-backed page cache charged to this cgroup, in bytes.
+
+    An offloaded checkpoint is read through an mmap, so its resident pages are
+    file-backed and land in the cgroup's page cache. Those pages are reclaimable
+    -- the kernel drops them under pressure and re-reads from disk -- so they do
+    not compete with a new pinned (anonymous, unreclaimable) allocation for the
+    headroom below the cap. `memory.current` counts them all the same, so left
+    in the usage they shrink the planning budget for no reason and spill layers
+    onto the mapped path. v2 exposes the total as `file`; v1 splits it into the
+    inactive and active file LRUs.
+    """
+    stat: dict[str, int] = {}
+    try:
+        with open(os.path.join(directory, "memory.stat")) as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        stat[parts[0]] = int(parts[1])
+                    except ValueError:
+                        continue
+    except OSError:
+        return 0
+    if is_v2:
+        return stat.get("file", 0)
+    return stat.get("total_inactive_file", 0) + stat.get("total_active_file", 0)
+
+
 def cgroup_memory_limit_bytes() -> tuple[int, int] | None:
-    """This process's (cap, usage) under its cgroup, or None when uncapped.
+    """This process's (cap, unreclaimable usage) under its cgroup, or None.
 
     The tightest cap in the chain wins. A nested cgroup -- a systemd scope with
     MemoryMax, a container started with --cgroup-parent -- holds this process
     below whatever the mount root allows, and planning against the root would
     commit memory the process cannot have.
+
+    The usage returned is `memory.current` less the reclaimable file-backed page
+    cache, so it is the anonymous charge that a new pinned allocation actually
+    has to fit beside. Counting the mmap'd checkpoint's page cache here would
+    tighten the budget against memory the kernel can always reclaim.
     """
     for mount, limit_name, usage_name in _CGROUP_MOUNTS:
+        is_v2 = usage_name == "memory.current"
         tightest = None
         for directory in _cgroup_dirs(mount):
             limit = _read_int(os.path.join(directory, limit_name))
@@ -119,7 +154,9 @@ def cgroup_memory_limit_bytes() -> tuple[int, int] | None:
                 continue
             if tightest is not None and limit >= tightest[0]:
                 continue
-            tightest = (limit, _read_int(os.path.join(directory, usage_name)) or 0)
+            usage = _read_int(os.path.join(directory, usage_name)) or 0
+            reclaimable = _cgroup_reclaimable_file_bytes(directory, is_v2)
+            tightest = (limit, max(0, usage - reclaimable))
         if tightest is not None:
             return tightest
     return None
@@ -261,5 +298,6 @@ def describe_host_memory() -> str:
     limit, usage = capped
     return (
         f"{available / GIB_BYTES:.1f} GiB available "
-        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
+        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, "
+        f"{usage / GIB_BYTES:.1f} GiB unreclaimable in use)"
     )

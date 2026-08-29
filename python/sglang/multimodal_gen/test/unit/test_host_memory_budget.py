@@ -59,6 +59,18 @@ class TestCgroupLimit:
         _point_at(monkeypatch, tmp_path, v2=(32 * GIB_BYTES, 4 * GIB_BYTES))
         assert cgroup_memory_limit_bytes() == (32 * GIB_BYTES, 4 * GIB_BYTES)
 
+    def test_reclaimable_page_cache_is_excluded_from_usage(
+        self, monkeypatch, tmp_path
+    ):
+        # memory.current counts the mmap'd checkpoint's page cache, but it is
+        # reclaimable and must not shrink the pinning budget: only the anonymous
+        # charge a new pinned allocation has to fit beside should remain.
+        _point_at(monkeypatch, tmp_path, v2=(32 * GIB_BYTES, 20 * GIB_BYTES))
+        (tmp_path / "v2" / "memory.stat").write_text(
+            f"anon {4 * GIB_BYTES}\nfile {16 * GIB_BYTES}\n"
+        )
+        assert cgroup_memory_limit_bytes() == (32 * GIB_BYTES, 4 * GIB_BYTES)
+
     def test_v1_cap_is_read_when_v2_is_absent(self, monkeypatch, tmp_path):
         _point_at(monkeypatch, tmp_path, v1=(64 * GIB_BYTES, 8 * GIB_BYTES))
         assert cgroup_memory_limit_bytes() == (64 * GIB_BYTES, 8 * GIB_BYTES)
