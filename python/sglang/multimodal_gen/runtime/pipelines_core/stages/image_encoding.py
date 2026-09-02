@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -459,6 +460,16 @@ class LTX2ImageEncodingStage(PipelineStage):
         "image_latent",
         "ltx2_num_image_tokens",
     )
+
+    # Le VAE-encode du conditionnement i2v doit tourner LÀ où le VAE est chargé.
+    # En disagg, le mapping (composed_pipeline_base) ne provisionne le VAE qu'au
+    # rôle DENOISER pour ti2v, et `batch.latents` y arrive déjà via le handoff.
+    # Sans cet override, le stage hérite du défaut ENCODER (base.py) → tourne
+    # sans VAE → « VAE must be provided for LTX-2 TI2V ». Le VAE-encode est
+    # transitoire (résidence gérée) : sa VRAM retombe avant les steps du DiT.
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
 
     def __init__(self, vae=None, **kwargs) -> None:
         super().__init__()
