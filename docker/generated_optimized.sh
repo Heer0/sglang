@@ -37,6 +37,26 @@ COMMON=(
   --cpu-offload-components connectors vae vocoder audio_vae
 )
 
+# IMAGE / IMAGE_LAST : conditionnement image. Le VAE encode dans le rôle DENOISER —
+# le seul qui le charge en disagg (cf. 1a3f75ca90) — pic mesuré ~5 GiB à 640x640x49,
+# encode compris. Vide = texte pur, comportement inchangé.
+#
+# L'ORDRE porte la sémantique : _get_ltx2_condition_spans ancre l'image 0 au span de
+# tokens 0 (première frame) et l'image 1 à seq_len - num_img_tokens (la dernière).
+# Au-delà de deux, le pipeline lève. IMAGE_LAST sans IMAGE n'a donc aucun sens : la
+# seule image fournie serait ancrée à la frame 0.
+if [ -n "${IMAGE:-}" ]; then
+  if [ -n "${IMAGE_LAST:-}" ]; then
+    COMMON+=(--image-path "$IMAGE" "$IMAGE_LAST")
+    echo "conditionnement : début=$IMAGE  fin=$IMAGE_LAST"
+  else
+    COMMON+=(--image-path "$IMAGE")
+    echo "conditionnement : début=$IMAGE"
+  fi
+elif [ -n "${IMAGE_LAST:-}" ]; then
+  echo "IMAGE_LAST sans IMAGE : ignoré (une image seule est ancrée à la frame 0)" >&2
+fi
+
 # DIT_OFFLOAD=1 (défaut) : layerwise offload du DiT (stream, VRAM mini, mais RAM
 #   CPU pinned/mapped → sujet au bug cgroup). DIT_OFFLOAD=0 : DiT RÉSIDENT en VRAM
 #   (rentre en disagg car le denoiser est seul ; pas de RAM CPU → esquive le bug
